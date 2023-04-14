@@ -12,106 +12,27 @@
 #include "bh1750.h"
 #include "LIS3DH.h"
 #include "ble.h"
+#include "vl53l1x/vl53l1_api.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "driver/gpio.h"
 
 static const char *TAG = "example";
 
-
-#define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
-#define RMT_LED_STRIP_GPIO_NUM      6
-#define LED_NUMBERS         20
-#define EXAMPLE_CHASE_SPEED_MS      10
-
 #define I2C_MASTER_SCL_IO           7
 #define I2C_MASTER_SDA_IO           8
-#define I2C_MASTER_NUM              0                          /*!< I2C master i2c port number, the number of i2c peripheral interfaces available will depend on the chip */
-#define I2C_MASTER_FREQ_HZ          400000                     /*!< I2C master clock frequency */
+#define I2C_MASTER_NUM              0
+#define I2C_MASTER_FREQ_HZ          200000                     /*!< I2C master clock frequency */
 #define I2C_MASTER_TX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */
 #define I2C_MASTER_RX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */
 
-static uint8_t led_strip_pixels[LED_NUMBERS * 3];
-static uint8_t s_led_state = 0;
-static led_strip_handle_t led_strip;
+#define VL53L1X_GPIO 0
+#define VL53L1X_XSHUT 2
+#define STORAGE_NAMESPACE "vl53l1Data"
 
-static void blink_led(void)
-{
-    /* If the addressable LED is enabled */
-    if (s_led_state) {
-        /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
-        for (int i = 0; i < LED_NUMBERS; ++i) {
-            led_strip_set_pixel(led_strip, i, 16, 16, 16);
-        }
-        /* Refresh the strip to send data */
-        led_strip_refresh(led_strip);
-    } else {
-        /* Set all LED off to clear all pixels */
-        led_strip_clear(led_strip);
-    }
-}
+//#define CALIBRATION_VL53L1 1
 
-static void configure_led(void)
-{
-    ESP_LOGI(TAG, "Example configured to blink addressable LED!");
-    /* LED strip initialization with the GPIO and pixels number*/
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = RMT_LED_STRIP_GPIO_NUM,
-        .max_leds = LED_NUMBERS, // at least one LED on board
-    };
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000, // 10MHz
-    };
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    /* Set all LED off to clear all pixels */
-    led_strip_clear(led_strip);
-}
-
-void led_strip_hsv2rgb(uint32_t h, uint32_t s, uint32_t v, uint32_t *r, uint32_t *g, uint32_t *b)
-{
-    h %= 360; // h -> [0,360]
-    uint32_t rgb_max = v * 2.55f;
-    uint32_t rgb_min = rgb_max * (100 - s) / 100.0f;
-
-    uint32_t i = h / 60;
-    uint32_t diff = h % 60;
-
-    // RGB adjustment amount by hue
-    uint32_t rgb_adj = (rgb_max - rgb_min) * diff / 60;
-
-    switch (i) {
-        case 0:
-            *r = rgb_max;
-            *g = rgb_min + rgb_adj;
-            *b = rgb_min;
-            break;
-        case 1:
-            *r = rgb_max - rgb_adj;
-            *g = rgb_max;
-            *b = rgb_min;
-            break;
-        case 2:
-            *r = rgb_min;
-            *g = rgb_max;
-            *b = rgb_min + rgb_adj;
-            break;
-        case 3:
-            *r = rgb_min;
-            *g = rgb_max - rgb_adj;
-            *b = rgb_max;
-            break;
-        case 4:
-            *r = rgb_min + rgb_adj;
-            *g = rgb_min;
-            *b = rgb_max;
-            break;
-        default:
-            *r = rgb_max;
-            *g = rgb_min;
-            *b = rgb_max - rgb_adj;
-            break;
-    }
-}
-
-static esp_err_t i2c_master_init(void)
-{
+static esp_err_t i2c_master_init(void) {
     int i2c_master_port = I2C_MASTER_NUM;
 
     i2c_config_t conf = {
@@ -128,89 +49,195 @@ static esp_err_t i2c_master_init(void)
     return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
 }
 
+static void nvs_calib_vl53l1_reset() //clear flag
+{
+    nvs_handle my_handle;
+    esp_err_t err;
+    err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
+    ESP_ERROR_CHECK(err);
+    err = nvs_erase_key(my_handle, "calibrationData");
+    ESP_ERROR_CHECK(err);
+    err = nvs_commit(my_handle);
+    ESP_ERROR_CHECK(err);
+    // Close
+    nvs_close(my_handle);
 
-void led_strip_test() {
-    uint32_t red = 0;
-    uint32_t green = 0;
-    uint32_t blue = 0;
-    uint16_t hue = 0;
-    uint16_t start_rgb = 0;
+    //restart esp32
+    esp_restart();
+}
 
-    ESP_LOGI(TAG, "Create RMT TX channel");
-    rmt_channel_handle_t led_chan = NULL;
-    rmt_tx_channel_config_t tx_chan_config = {
-            .clk_src = RMT_CLK_SRC_DEFAULT, // select source clock
-            .gpio_num = RMT_LED_STRIP_GPIO_NUM,
-            .mem_block_symbols = 64, // increase the block size can make the LED less flickering
-            .resolution_hz = RMT_LED_STRIP_RESOLUTION_HZ,
-            .trans_queue_depth = 4, // set the number of transactions that can be pending in the background
-    };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &led_chan));
+static esp_err_t nvs_set_get_vl53l1(VL53L1_CalibrationData_t *calib_data, bool is_set)   //set: 1  get:0
+{
 
-    ESP_LOGI(TAG, "Install led strip encoder");
-    rmt_encoder_handle_t led_encoder = NULL;
-    led_strip_encoder_config_t encoder_config = {
-            .resolution = RMT_LED_STRIP_RESOLUTION_HZ,
-    };
-    ESP_ERROR_CHECK(rmt_new_led_strip_encoder(&encoder_config, &led_encoder));
+    nvs_handle my_handle;
+    esp_err_t err;
+    err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
+    ESP_ERROR_CHECK(err);
+    size_t calib_data_size = (size_t)sizeof(VL53L1_CalibrationData_t);
+    if (is_set)
+    {
 
-    ESP_LOGI(TAG, "Enable RMT TX channel");
-    ESP_ERROR_CHECK(rmt_enable(led_chan));
+        //store calibrationData
+        char *pData = malloc(calib_data_size + sizeof(uint8_t));
+        memcpy(pData, calib_data, calib_data_size);
+        err = nvs_set_blob(my_handle, "calibrationData", pData, calib_data_size);
+        ESP_ERROR_CHECK(err);
+        err = nvs_commit(my_handle);
+        ESP_ERROR_CHECK(err);
+        ESP_LOGI(TAG, "calibrationData saved ! ");
+        free(pData);
+    }
+    else
+    {
+        err = nvs_get_blob(my_handle, "calibrationData", calib_data, &calib_data_size);
+        // ESP_ERROR_CHECK(err);
+    }
 
-    ESP_LOGI(TAG, "Start LED rainbow chase");
-    rmt_transmit_config_t tx_config = {
-            .loop_count = 0, // no transfer loop
-    };
-    while (1) {
-        for (int i = 0; i < 3; i++) {
-            for (int j = i; j < LED_NUMBERS; j += 3) {
-                // Build RGB pixels
-                hue = j * 360 / LED_NUMBERS + start_rgb;
-                led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-                led_strip_pixels[j * 3 + 0] = green;
-                led_strip_pixels[j * 3 + 1] = blue;
-                led_strip_pixels[j * 3 + 2] = red;
-            }
-            // Flush RGB values to LEDs
-            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-            vTaskDelay(pdMS_TO_TICKS(EXAMPLE_CHASE_SPEED_MS));
-            memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
-            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-            vTaskDelay(pdMS_TO_TICKS(EXAMPLE_CHASE_SPEED_MS));
+    // Close
+    nvs_close(my_handle);
+    return err;
+}
+
+/*Calibration  vl53l1 module*/
+static VL53L1_CalibrationData_t vl53l1_calibration(VL53L1_Dev_t *dev)
+{
+    int status;
+    int32_t targetDistanceMilliMeter = 703;
+    VL53L1_CalibrationData_t calibrationData;
+    //status = VL53L1_WaitDeviceBooted(dev);
+    //status = VL53L1_DataInit(dev);                                       //performs the device initialization
+    //status = VL53L1_StaticInit(dev);                                     // load device settings specific for a given use case.
+    status = VL53L1_SetPresetMode(dev,VL53L1_PRESETMODE_AUTONOMOUS);
+    status = VL53L1_PerformRefSpadManagement(dev);
+    status = VL53L1_PerformOffsetCalibration(dev,targetDistanceMilliMeter);
+    status = VL53L1_PerformSingleTargetXTalkCalibration(dev,targetDistanceMilliMeter);
+    status = VL53L1_GetCalibrationData(dev,&calibrationData);
+
+    if (status)
+    {
+        ESP_LOGE(TAG, "vl53l1_calibration failed \n");
+        calibrationData.struct_version = 0;
+        return calibrationData;
+
+    }else
+    {
+        ESP_LOGI(TAG, "vl53l1_calibration done ! version = %lu \n",calibrationData.struct_version);
+        return calibrationData;
+    }
+
+}
+
+/*init  vl53l1 module*/
+static void vl53l1_init(VL53L1_Dev_t *dev) {
+    VL53L1_UserRoi_t Roi0;
+    Roi0.TopLeftX = 0; //set ROI according to requirement
+    Roi0.TopLeftY = 15;
+    Roi0.BotRightX = 15;
+    Roi0.BotRightY = 0;
+    int status = VL53L1_WaitDeviceBooted(dev);
+    status = VL53L1_DataInit(dev);                                       //performs the device initialization
+    status = VL53L1_StaticInit(dev);                                     // load device settings specific for a given use case.
+
+#ifdef CALIBRATION_VL53L1
+    VL53L1_CalibrationData_t calibData;
+    esp_err_t err = nvs_set_get_vl53l1(&calibData, 0);
+    if (err == ESP_OK)
+    {
+        status = VL53L1_SetCalibrationData(dev, &calibData);
+        if (status != VL53L1_ERROR_NONE)
+        {
+            ESP_LOGE(TAG, "VL53L1_SetCalibrationData failed \n");
         }
-        start_rgb += 60;
+        else
+        {
+            ESP_LOGI(TAG, "VL53L1_SetCalibrationData done  \n");
+        }
+    }
+    else
+    {
+        //wait for calibration
+        int8_t delay_prepare_for_calibration = 5;
+        for (int8_t i = delay_prepare_for_calibration; i > 0; i--)
+        {
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            ESP_LOGI(TAG, "prepare_for_calibration %d \n", i);
+        }
+
+        calibData = vl53l1_calibration(dev);
+        nvs_set_get_vl53l1(&calibData, 1);
+
+        //restart esp32
+        esp_restart();
+
+    }
+#endif
+
+    status = VL53L1_SetDistanceMode(dev,VL53L1_DISTANCEMODE_LONG);      //Max distance in dark:Short:136cm Medium:290cm long:360cm
+    status = VL53L1_SetMeasurementTimingBudgetMicroSeconds(dev,160000);
+    status = VL53L1_SetInterMeasurementPeriodMilliSeconds(dev,200);     //period of time between two consecutive measurements
+    status = VL53L1_SetUserROI(dev, &Roi0); //SET region of interest
+    status = VL53L1_StartMeasurement(dev);
+
+    if (status != VL53L1_ERROR_NONE) {
+        ESP_LOGE(TAG, "VL53L1_StartMeasurement failed \n");
+
+    } else {
+        ESP_LOGI(TAG, "VL53L1 StartMeasurement  \n");
     }
 }
 
-void app_main(void)
-{
+void app_main(void) {
+    // Initialize NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
-    /* Configure the peripheral according to the LED type */
-    configure_led();
-    //led_strip_test();
 
-//    uint8_t data[2];
-//    ESP_ERROR_CHECK(i2c_master_init());
-//    ESP_LOGI(TAG, "I2C initialized successfully");
-//
-//    light_sensor_reset();
-//    ESP_LOGI(TAG, "light sensor reset");
-//    vTaskDelay(pdMS_TO_TICKS(20));
-//    light_sensor_on();
-//
-//    while(1) {
-//        light_sensor_on();
-//        light_sensor_start(CONTINUE_HRES_MODE);
-//        // wait 180ms
-//        vTaskDelay(pdMS_TO_TICKS(180));
-//        uint16_t light = light_sensor_read_light();
-//
-//        ESP_LOGI(TAG, "light = %d", light);
-//
-//        uint8_t lis3dh_status = lis3dh_read_status();
-//        ESP_LOGI(TAG, "lisd3h status = %x", lis3dh_status);
-//    }
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_LOGI(TAG, "i2c init success %d", I2C_MASTER_NUM);
 
-    ble_start();
+    // xshut high
+    gpio_set_direction(VL53L1X_XSHUT, GPIO_MODE_OUTPUT); //
+    gpio_set_level(VL53L1X_XSHUT, 1);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+
+    VL53L1_Dev_t vl53l1_dev;
+    vl53l1_dev.i2c_num = I2C_MASTER_NUM;
+    vl53l1_dev.I2cDevAddr = (0x52 >> 1);
+    uint8_t byteData;
+    uint16_t wordData;
+    VL53L1_RdByte(&vl53l1_dev, 0x010F, &byteData);
+    ESP_LOGI(TAG, "VL53L1X Model_ID: %02X\n\r", byteData);
+    VL53L1_RdByte(&vl53l1_dev, 0x0110, &byteData);
+    ESP_LOGI(TAG, "VL53L1X Module_Type: %02X\n\r", byteData);
+    VL53L1_RdWord(&vl53l1_dev, 0x010F, &wordData);
+    ESP_LOGI(TAG, "VL53L1X: %02X\n\r", wordData);
+
+    vl53l1_init(&vl53l1_dev);
+
+    VL53L1_RangingMeasurementData_t pRangingMeasurementData;
+    while (1) {
+        int status = VL53L1_WaitMeasurementDataReady(&vl53l1_dev); //5 HZ
+        if (status == VL53L1_ERROR_NONE) {
+            status = VL53L1_GetRangingMeasurementData(&vl53l1_dev, &pRangingMeasurementData);
+            if (status == 0 && pRangingMeasurementData.RangeStatus == VL53L1_RANGESTATUS_RANGE_VALID) {
+                ESP_LOGI(TAG, "height %3.1fcm \n", pRangingMeasurementData.RangeMilliMeter * 1.0f / 10);
+            } else {
+
+                ESP_LOGW(TAG, "height %3.1fcm %d %d level:%d\n", pRangingMeasurementData.RangeMilliMeter * 1.0f / 10,
+                         status, pRangingMeasurementData.RangeStatus, pRangingMeasurementData.RangeQualityLevel);
+            }
+
+            status = VL53L1_ClearInterruptAndStartMeasurement(&vl53l1_dev); //clear Interrupt start next measurement
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 }
 
